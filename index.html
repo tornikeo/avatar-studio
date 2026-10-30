@@ -91,12 +91,22 @@
   .file-label{ display:inline-flex; align-items:center; min-height:46px; }
   button:focus-visible, label:focus-visible, input:focus-visible{ outline:2px solid var(--accent); outline-offset:2px; }
   .canvas-wrap.dragover{ outline:2px dashed var(--accent); outline-offset:-8px; }
+  .empty-state{ position:absolute; inset:0; display:flex; align-items:center; justify-content:center; cursor:pointer; }
+  .empty-state[hidden]{ display:none; }
+  .empty-card{ width:52%; height:52%; flex:none; overflow:hidden; border-radius:50%; border:2px dashed rgba(255,255,255,.8); background:rgba(10,10,12,.55); display:flex; flex-direction:column; align-items:center; justify-content:center; gap:6px; text-align:center; padding:18px; }
+  .empty-card .plus{ font-size:44px; font-weight:300; line-height:1; color:var(--accent); }
+  .empty-card b{ font-size:19px; }
+  .empty-card span{ font-size:12.5px; color:#d8d5cc; line-height:1.45; }
   /* Mobile: sticky compact preview, controls scroll under it */
   @media (max-width:900px){
     header{ padding:16px 16px 10px; gap:8px; }
     header h1{ font-size:21px; }
     .stage{ position:sticky; top:0; z-index:20; background:var(--bg); padding:10px 16px 6px; box-shadow:0 10px 24px rgba(0,0,0,.45); }
     .canvas-wrap{ max-width:min(76vw,330px); margin:0 auto; }
+    .empty-card{ width:66%; height:66%; padding:14px; }
+    .empty-card .plus{ font-size:34px; }
+    .empty-card b{ font-size:17px; }
+    .empty-card span{ font-size:11.5px; }
     .hint{ text-align:center; margin:6px 0 2px; }
     .feed-test{ display:none; }
     .panel{ padding:16px 14px 48px; gap:14px; }
@@ -115,8 +125,15 @@
     <div class="canvas-wrap" id="wrap">
       <canvas id="stage" width="1080" height="1080"></canvas>
       <div class="circle-guide" id="guide"></div>
+      <div class="empty-state" id="emptyState" role="button" tabindex="0" aria-label="Upload photo">
+        <div class="empty-card">
+          <div class="plus">+</div>
+          <b>Add your photo</b>
+          <span>Drop it here or click to upload.<br>Transparent PNG works best.</span>
+        </div>
+      </div>
     </div>
-    <div class="hint">Drag to move · scroll to zoom · drop a photo to swap it</div>
+    <div class="hint">Drop a photo to start · drag to move · scroll to zoom</div>
     <div class="feed-test">
       <h3>Feed sizes</h3>
       <div class="post"><canvas class="mini" id="m96" width="96" height="96" style="width:48px;height:48px"></canvas>
@@ -155,9 +172,9 @@
     <section>
       <h2>Photo</h2>
       <div class="export-row" style="margin-bottom:10px">
-        <label class="btn primary file-label" for="photoInput">Replace photo</label>
+        <label class="btn primary file-label" for="photoInput" id="uploadLabel">Upload photo</label>
         <input type="file" id="photoInput" accept="image/*">
-        <button class="btn" id="demoBtn">Demo photo</button>
+        <button class="btn" id="removeBtn">Remove photo</button>
       </div>
       <p style="font-size:12px;color:var(--dim);margin-bottom:8px">Transparent PNG works best. Or drop an image on the preview.</p>
       <div id="personSliders"></div>
@@ -192,11 +209,11 @@ const state = {
   outlineColor:"#141414", ringColor:"#141414",
   scale:34, detail:50, rotation:0, seed:7,
   shapeSize:76, shapeY:46,
-  personScale:165, personX:-335, personY:-545,
+  personScale:140, personX:0, personY:0,
   outline:14, ring:10,
   flip:false, shadow:true,
 };
-const DEFAULT_PERSON = { personScale:165, personX:-335, personY:-545 };
+/* No bundled photo: the app starts on the upload empty state. fitPerson() frames each upload. */
 const PALETTES = [
   {name:"Signal",  base:"#ffd400", ink:"#141414", pop:"#e63329", shape:"#ffffff"},
   {name:"Court",   base:"#1d7a3a", ink:"#f4f1e6", pop:"#ffd400", shape:"#f4f1e6"},
@@ -224,7 +241,7 @@ function mulberry(seed){ let t = seed >>> 0; return function(){ t += 0x6D2B79F5;
 const canvas = document.getElementById("stage");
 const ctx = canvas.getContext("2d");
 const cutout = new Image();
-cutout.src = "assets/cutout_sam.png";
+let hasPhoto = false;
 
 function drawPattern(c){
   const { base, ink, pop } = state;
@@ -348,7 +365,7 @@ function render(){
   ctx.clearRect(0,0,S,S);
   drawPattern(ctx);
   drawShape(ctx);
-  if(cutout.complete && cutout.naturalWidth){
+  if(hasPhoto && cutout.complete && cutout.naturalWidth){
     const iw = cutout.naturalWidth, ih = cutout.naturalHeight, k = state.personScale/100;
     const f = S * k / iw, dw = (iw + PAD*2) * f, dh = (ih + PAD*2) * f, off = PAD * f;
     ctx.save();
@@ -364,20 +381,32 @@ function render(){
     g.drawImage(canvas, 0, 0, sz, sz); g.restore();
   }
 }
-let isDemo = true, pendingFit = false, objUrl = null;
+let pendingFit = false, objUrl = null;
 function fitPerson(){
+  if(!hasPhoto) return;
   const iw = cutout.naturalWidth, ih = cutout.naturalHeight; if(!iw) return;
   state.personScale = Math.round(Math.min(320, Math.max(60, 102 * Math.max(1, iw/ih))));
   const dw = S * state.personScale/100, dh = dw * ih/iw;
   state.personX = Math.round((S - dw)/2); state.personY = Math.round((S - dh)/2);
 }
-function setPhoto(src, demo){
-  isDemo = demo; pendingFit = !demo; baked = null; bakedKey = "";
+function syncPhotoUI(){
+  const empty = document.getElementById("emptyState");
+  if(empty) empty.hidden = hasPhoto;
+  const lbl = document.getElementById("uploadLabel");
+  if(lbl) lbl.textContent = hasPhoto ? "Replace photo" : "Upload photo";
+  const rm = document.getElementById("removeBtn");
+  if(rm) rm.disabled = !hasPhoto;
+}
+function setPhoto(src){
+  pendingFit = true; baked = null; bakedKey = "";
   cutout.src = src;
 }
 cutout.addEventListener("load", ()=>{
+  if(!cutout.naturalWidth) return;
+  hasPhoto = true;
   baked = null; bakedKey = "";
   if(pendingFit){ fitPerson(); pendingFit = false; refreshSliders(); }
+  syncPhotoUI();
   render();
 });
 
@@ -439,15 +468,24 @@ $("flipBtn").addEventListener("click", e=>{ state.flip = !state.flip; e.target.c
 $("shadowBtn").classList.toggle("active", state.shadow);
 $("shadowBtn").addEventListener("click", e=>{ state.shadow = !state.shadow; e.target.classList.toggle("active", state.shadow); render(); });
 $("guideBtn").addEventListener("click", e=>{ const g = $("guide"); g.classList.toggle("off"); e.target.classList.toggle("active", !g.classList.contains("off")); });
-$("fitBtn").addEventListener("click", ()=>{ if(isDemo) Object.assign(state, DEFAULT_PERSON); else fitPerson(); refreshSliders(); render(); });
+$("fitBtn").addEventListener("click", ()=>{ fitPerson(); refreshSliders(); render(); });
 function useFile(file){
   if(!file || !file.type.startsWith("image/")) return;
   if(objUrl) URL.revokeObjectURL(objUrl);
   objUrl = URL.createObjectURL(file);
-  setPhoto(objUrl, false);
+  setPhoto(objUrl);
 }
 $("photoInput").addEventListener("change", e=> useFile(e.target.files[0]));
-$("demoBtn").addEventListener("click", ()=>{ Object.assign(state, DEFAULT_PERSON); refreshSliders(); setPhoto("assets/cutout_sam.png", true); });
+$("removeBtn").addEventListener("click", ()=>{
+  hasPhoto = false; baked = null; bakedKey = "";
+  if(objUrl){ URL.revokeObjectURL(objUrl); objUrl = null; }
+  $("photoInput").value = "";
+  syncPhotoUI(); render();
+});
+$("emptyState").addEventListener("pointerdown", e=> e.stopPropagation());
+$("emptyState").addEventListener("click", ()=> $("photoInput").click());
+$("emptyState").addEventListener("keydown", e=>{ if(e.key === "Enter" || e.key === " "){ e.preventDefault(); $("photoInput").click(); } });
+syncPhotoUI();
 
 /* Drag + wheel on stage */
 const wrap = $("wrap"); let drag = null;
