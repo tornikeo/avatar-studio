@@ -89,6 +89,10 @@
   input[type=range]{ height:34px; }
   input[type=file]{ display:none; }
   .file-label{ display:inline-flex; align-items:center; min-height:46px; }
+  .file-label.busy{ opacity:.55; pointer-events:none; }
+  .btn:disabled{ opacity:.45; cursor:not-allowed; }
+  .photo-status{ font-size:12px; line-height:1.45; color:var(--dim); margin:-2px 0 8px; }
+  .photo-status.error{ color:#ff9587; }
   button:focus-visible, label:focus-visible, input:focus-visible{ outline:2px solid var(--accent); outline-offset:2px; }
   .canvas-wrap.dragover{ outline:2px dashed var(--accent); outline-offset:-8px; }
   .empty-state{ position:absolute; inset:0; display:flex; align-items:center; justify-content:center; cursor:pointer; }
@@ -173,10 +177,11 @@
       <h2>Photo</h2>
       <div class="export-row" style="margin-bottom:10px">
         <label class="btn primary file-label" for="photoInput" id="uploadLabel">Upload photo</label>
-        <input type="file" id="photoInput" accept="image/*">
+        <input type="file" id="photoInput" accept="image/*,.heic,.heif">
         <button class="btn" id="removeBtn">Remove photo</button>
       </div>
-      <p style="font-size:12px;color:var(--dim);margin-bottom:8px">Transparent PNG works best. Or drop an image on the preview.</p>
+      <p style="font-size:12px;color:var(--dim);margin-bottom:8px">HEIC, JPG, PNG or WebP. Transparent PNG works best.</p>
+      <p class="photo-status" id="photoStatus" role="status" aria-live="polite" hidden></p>
       <div id="personSliders"></div>
       <div class="colors" style="margin-top:8px">
         <label class="colorbox"><input type="color" id="cOutline"><div><b>Outline</b><span data-hex="cOutline"></span></div></label>
@@ -240,7 +245,7 @@ function mulberry(seed){ let t = seed >>> 0; return function(){ t += 0x6D2B79F5;
 
 const canvas = document.getElementById("stage");
 const ctx = canvas.getContext("2d");
-const cutout = new Image();
+let cutout = new Image();
 let hasPhoto = false;
 
 function drawPattern(c){
@@ -381,7 +386,12 @@ function render(){
     g.drawImage(canvas, 0, 0, sz, sz); g.restore();
   }
 }
-let pendingFit = false, objUrl = null;
+const MAX_PHOTO_DIMENSION = 2048;
+const HEIC_TO_URL = "https://cdn.jsdelivr.net/npm/heic-to@1.6.7/dist/iife/heic-to.js";
+let objUrl = null;
+let photoBusy = false;
+let photoSeq = 0;
+let heicToPromise = null;
 function fitPerson(){
   if(!hasPhoto) return;
   const iw = cutout.naturalWidth, ih = cutout.naturalHeight; if(!iw) return;
@@ -393,22 +403,120 @@ function syncPhotoUI(){
   const empty = document.getElementById("emptyState");
   if(empty) empty.hidden = hasPhoto;
   const lbl = document.getElementById("uploadLabel");
-  if(lbl) lbl.textContent = hasPhoto ? "Replace photo" : "Upload photo";
+  if(lbl){
+    lbl.textContent = photoBusy ? "Working…" : hasPhoto ? "Replace photo" : "Upload photo";
+    lbl.classList.toggle("busy", photoBusy);
+  }
+  const input = document.getElementById("photoInput");
+  if(input) input.disabled = photoBusy;
   const rm = document.getElementById("removeBtn");
-  if(rm) rm.disabled = !hasPhoto;
+  if(rm) rm.disabled = photoBusy || !hasPhoto;
 }
-function setPhoto(src){
-  pendingFit = true; baked = null; bakedKey = "";
-  cutout.src = src;
+function setPhotoStatus(message, isError = false){
+  const el = document.getElementById("photoStatus");
+  if(!el) return;
+  el.hidden = !message;
+  el.textContent = message || "";
+  el.classList.toggle("error", !!isError);
 }
-cutout.addEventListener("load", ()=>{
-  if(!cutout.naturalWidth) return;
+function isHeicFile(file){
+  return /image\/hei[cf]/i.test(file?.type || "") || /\.hei[cf]$/i.test(file?.name || "");
+}
+function loadHeicTo(){
+  if(typeof window.HeicTo === "function") return Promise.resolve(window.HeicTo);
+  if(!heicToPromise){
+    heicToPromise = new Promise((resolve, reject)=>{
+      const script = document.createElement("script");
+      script.src = HEIC_TO_URL;
+      script.async = true;
+      script.onload = ()=>{
+        if(typeof window.HeicTo === "function") resolve(window.HeicTo);
+        else { heicToPromise = null; reject(new Error("HEIC converter did not load")); }
+      };
+      script.onerror = ()=>{ heicToPromise = null; reject(new Error("Could not load HEIC converter")); };
+      document.head.appendChild(script);
+    });
+  }
+  return heicToPromise;
+}
+async function decodeDrawable(blob){
+  if(window.createImageBitmap){
+    try {
+      let bmp;
+      try { bmp = await createImageBitmap(blob, { imageOrientation: "from-image" }); }
+      catch { bmp = await createImageBitmap(blob); }
+      return { source: bmp, width: bmp.width, height: bmp.height, dispose: ()=> bmp.close && bmp.close() };
+    } catch { /* fall through to Image */ }
+  }
+  const url = URL.createObjectURL(blob);
+  const img = new Image();
+  try {
+    await new Promise((resolve, reject)=>{
+      img.onload = resolve;
+      img.onerror = ()=> reject(new Error("Image could not be decoded"));
+      img.src = url;
+    });
+    if(!img.naturalWidth) throw new Error("Image could not be decoded");
+    return { source: img, width: img.naturalWidth, height: img.naturalHeight, dispose: ()=> URL.revokeObjectURL(url) };
+  } catch(e) {
+    URL.revokeObjectURL(url);
+    throw e;
+  }
+}
+async function resizePhotoBlob(blob){
+  const decoded = await decodeDrawable(blob);
+  try {
+    const scale = Math.min(1, MAX_PHOTO_DIMENSION / Math.max(decoded.width, decoded.height));
+    if(scale === 1) return blob;
+    const cv = document.createElement("canvas");
+    cv.width = Math.max(1, Math.round(decoded.width * scale));
+    cv.height = Math.max(1, Math.round(decoded.height * scale));
+    const g = cv.getContext("2d");
+    if(!g) throw new Error("Could not process photo");
+    g.drawImage(decoded.source, 0, 0, cv.width, cv.height);
+    const type = /png|webp|avif|gif|svg/i.test(blob.type || "") ? "image/png" : "image/jpeg";
+    return await new Promise((resolve, reject)=>{
+      cv.toBlob(b => b ? resolve(b) : reject(new Error("Could not process photo")), type, 0.92);
+    });
+  } finally {
+    decoded.dispose();
+  }
+}
+async function preparePhotoBlob(file){
+  let working = file;
+  if(isHeicFile(file)){
+    let nativeOk = true;
+    try {
+      const decoded = await decodeDrawable(file);
+      decoded.dispose();
+    } catch { nativeOk = false; }
+    if(!nativeOk){
+      setPhotoStatus("Converting HEIC photo…");
+      const HeicTo = await loadHeicTo();
+      const converted = await HeicTo({ blob: file, type: "image/jpeg", quality: 0.92 });
+      working = Array.isArray(converted) ? converted[0] : converted;
+      if(!(working instanceof Blob)) working = await (await fetch(working)).blob();
+    }
+  }
+  return resizePhotoBlob(working);
+}
+function loadPreparedImage(url){
+  return new Promise((resolve, reject)=>{
+    const img = new Image();
+    img.onload = ()=> img.naturalWidth ? resolve(img) : reject(new Error("Image could not be decoded"));
+    img.onerror = ()=> reject(new Error("Image could not be decoded"));
+    img.src = url;
+  });
+}
+function adoptPhoto(img){
+  cutout = img;
   hasPhoto = true;
   baked = null; bakedKey = "";
-  if(pendingFit){ fitPerson(); pendingFit = false; refreshSliders(); }
+  fitPerson();
+  refreshSliders();
   syncPhotoUI();
   render();
-});
+}
 
 /* ---------- UI ---------- */
 const $ = id => document.getElementById(id);
@@ -469,17 +577,55 @@ $("shadowBtn").classList.toggle("active", state.shadow);
 $("shadowBtn").addEventListener("click", e=>{ state.shadow = !state.shadow; e.target.classList.toggle("active", state.shadow); render(); });
 $("guideBtn").addEventListener("click", e=>{ const g = $("guide"); g.classList.toggle("off"); e.target.classList.toggle("active", !g.classList.contains("off")); });
 $("fitBtn").addEventListener("click", ()=>{ fitPerson(); refreshSliders(); render(); });
-function useFile(file){
-  if(!file || !file.type.startsWith("image/")) return;
-  if(objUrl) URL.revokeObjectURL(objUrl);
-  objUrl = URL.createObjectURL(file);
-  setPhoto(objUrl);
+async function useFile(file){
+  if(!file) return;
+  if(!(file.type || "").startsWith("image/") && !isHeicFile(file)){
+    setPhotoStatus("That file isn’t an image.", true);
+    $("photoInput").value = "";
+    return;
+  }
+  const seq = ++photoSeq;
+  photoBusy = true;
+  setPhotoStatus(isHeicFile(file) ? "Converting HEIC photo…" : "Loading photo…");
+  syncPhotoUI();
+  try {
+    const prepared = await preparePhotoBlob(file);
+    if(seq !== photoSeq) return;
+    const nextUrl = URL.createObjectURL(prepared);
+    let img;
+    try { img = await loadPreparedImage(nextUrl); }
+    catch(e){ URL.revokeObjectURL(nextUrl); throw e; }
+    if(seq !== photoSeq){ URL.revokeObjectURL(nextUrl); return; }
+    const previousUrl = objUrl;
+    objUrl = nextUrl;
+    photoBusy = false;
+    setPhotoStatus("");
+    adoptPhoto(img);
+    if(previousUrl) URL.revokeObjectURL(previousUrl);
+  } catch(error) {
+    console.error(error);
+    if(seq === photoSeq){
+      photoBusy = false;
+      setPhotoStatus(isHeicFile(file) ? "Couldn't convert that HEIC. Try exporting it as JPEG." : "Couldn't read that image. Try JPG, PNG or WebP.", true);
+      syncPhotoUI();
+    }
+  } finally {
+    if(seq === photoSeq){
+      if(photoBusy){ photoBusy = false; syncPhotoUI(); }
+      $("photoInput").value = "";
+    }
+  }
 }
 $("photoInput").addEventListener("change", e=> useFile(e.target.files[0]));
 $("removeBtn").addEventListener("click", ()=>{
-  hasPhoto = false; baked = null; bakedKey = "";
+  photoSeq++;
+  photoBusy = false;
+  hasPhoto = false;
+  cutout = new Image();
+  baked = null; bakedKey = "";
   if(objUrl){ URL.revokeObjectURL(objUrl); objUrl = null; }
   $("photoInput").value = "";
+  setPhotoStatus("");
   syncPhotoUI(); render();
 });
 $("emptyState").addEventListener("pointerdown", e=> e.stopPropagation());
